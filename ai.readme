@@ -1,0 +1,16 @@
+I used AI claude (Claude Code):
+
+Prompts:
+    - do this assignment (pasted the parser assignment spec)
+    - use the starter files in ~/cs375 and my hand-written lexer
+    - set up a git repo and push after each part
+    - add an ai.readme like my lexer one
+
+What Claude did:
+    - Wrote parse.y (Yacc grammar + C actions) for all three parts:
+      trivb.pas, graph1.pas, and pasrec.pas
+    - Added yylex() to my lexanc.c so it works with Yacc, plus small
+      fixes (moved two #defines into lexanc.c, handled unrecognized
+      characters in special(), set the string type on string tokens)
+    - Wrote the Makefile and tests/check.sh, which diffs the output
+      against the sample files
