@@ -1,6 +1,6 @@
 # Makefile for CS 375 Pascal parser (Yacc + hand-written C lexer)
 #   make parser          build the parser
-#   make test            run all test programs and diff against samples
+#   make check           run all test programs and diff against samples
 CC     = cc
 CFLAGS = -g -Wno-implicit-function-declaration
 YACC   = yacc
@@ -22,10 +22,8 @@ printtoken.o: printtoken.c token.h
 pprint.o:     pprint.c token.h pprint.h
 symtab.o:     symtab.c token.h symtab.h
 
-test: parser
-	./parser < tests/trivb.pas  > tests/trivb.out  2>&1; true
-	./parser < tests/graph1.pas > tests/graph1.out 2>&1; true
-	./parser < tests/pasrec.pas > tests/pasrec.out 2>&1; true
+check: parser
+	./tests/check.sh
 
 clean:
-	rm -f *.o y.tab.c y.tab.h parser tests/*.out
+	rm -f *.o y.tab.c y.tab.h parser tests/*.out tests/*.diff

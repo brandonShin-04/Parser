@@ -65,14 +65,28 @@ TOKEN parseresult;
 
 %%
 
-program    :  PROGRAM IDENTIFIER LPAREN idlist RPAREN SEMICOLON cblock DOT
+program    :  PROGRAM IDENTIFIER LPAREN idlist RPAREN SEMICOLON lblock DOT
                                        { parseresult = makeprogram($2, $4, $7); }
            ;
 idlist     :  IDENTIFIER COMMA idlist          { $$ = cons($1, $3); }
            |  IDENTIFIER                       { $$ = cons($1, NULL); }
            ;
-cblock     :  CONST cdefs vblock               { $$ = $3; }
+lblock     :  LABEL numlist SEMICOLON cblock   { $$ = $4; }
+           |  cblock
+           ;
+numlist    :  NUMBER COMMA numlist             { instlabel($1); }
+           |  NUMBER                           { instlabel($1); }
+           ;
+cblock     :  CONST cdefs tblock               { $$ = $3; }
+           |  tblock
+           ;
+tblock     :  TYPE tdefs vblock                { $$ = $3; }
            |  vblock
+           ;
+tdefs      :  tdef SEMICOLON tdefs
+           |  tdef SEMICOLON
+           ;
+tdef       :  IDENTIFIER EQ type               { insttype($1, $3); }
            ;
 cdefs      :  cdef SEMICOLON cdefs
            |  cdef SEMICOLON
@@ -94,8 +108,22 @@ varspecs   :  vargroup SEMICOLON varspecs
 vargroup   :  idlist COLON type                { instvars($1, $3); }
            ;
 type       :  simpletype
+           |  ARRAY LBRACKET simplelist RBRACKET OF type
+                                               { $$ = instarray($3, $6); }
+           |  RECORD fieldlist END             { $$ = instrec($1, $2); }
+           |  POINT IDENTIFIER                 { $$ = instpoint($1, $2); }
            ;
 simpletype :  IDENTIFIER                       { $$ = findtype($1); }
+           |  LPAREN idlist RPAREN             { $$ = instenum($2); }
+           |  constant DOTDOT constant         { $$ = instdotdot($1, $2, $3); }
+           ;
+simplelist :  simpletype COMMA simplelist      { $$ = cons($1, $3); }
+           |  simpletype                       { $$ = cons($1, NULL); }
+           ;
+fieldlist  :  fields SEMICOLON fieldlist       { $$ = nconc($1, $3); }
+           |  fields
+           ;
+fields     :  idlist COLON type                { $$ = instfields($1, $3); }
            ;
 block      :  BEGINBEGIN statement endpart
                                        { $$ = makepnb($1, cons($2, $3)); }
@@ -104,6 +132,9 @@ statement  :  block
            |  IF expr THEN statement endif     { $$ = makeif($1, $2, $4, $5); }
            |  assignment
            |  funcall
+           |  WHILE expr DO statement   { $$ = makewhile($1, $2, $3, $4); }
+           |  GOTO NUMBER                      { $$ = dogoto($1, $2); }
+           |  NUMBER COLON statement           { $$ = dolabel($1, $2, $3); }
            |  REPEAT stmtlist UNTIL expr
                                     { $$ = makerepeat($1, $2, $3, $4); }
            |  FOR assignment TO expr DO statement
@@ -142,9 +173,15 @@ factor     :  LPAREN expr RPAREN               { $$ = $2; }
            |  variable
            |  NUMBER
            |  STRING
+           |  NIL                              { $$ = fillintc($1, 0); }
            |  funcall
+           |  NOT factor                       { $$ = unaryop($1, $2); }
            ;
 variable   :  IDENTIFIER                       { $$ = findid($1); }
+           |  variable LBRACKET exprlist RBRACKET
+                                         { $$ = arrayref($1, $2, $3, $4); }
+           |  variable DOT IDENTIFIER          { $$ = reducedot($1, $2, $3); }
+           |  variable POINT                   { $$ = dopoint($1, $2); }
            ;
 compareop  :  EQ | LT | GT | NE | LE | GE | IN
            ;
@@ -377,6 +414,16 @@ TOKEN makefuncall(TOKEN tok, TOKEN fn, TOKEN args)
         else if (args->basicdt == REAL)
           strcat(fn->stringval, "f");
       }
+    if (strcmp(fn->stringval, "new") == 0 && args != NULL)
+      { TOKEN var = args;
+        SYMBOL ptype = var->symtype;          /* POINTERSYM */
+        SYMBOL target = ptype->datatype;      /* type name, e.g. person */
+        int size = (target->datatype != NULL) ? target->datatype->size
+                                              : target->size;
+        tok->basicdt = POINTER;
+        fn->link = makeintc(size);
+        return binop(makeop(ASSIGNOP), var, tok);
+      }
     sym = searchst(fn->stringval);
     if (sym != NULL && sym->kind == FUNCTIONSYM && sym->datatype != NULL
         && sym->datatype->datatype != NULL)
@@ -452,6 +499,258 @@ TOKEN makerepeat(TOKEN tok, TOKEN statements, TOKEN tokb, TOKEN expr)
     expr->link = empty;
     label->link = nconc(body, ifst);
     return makeprogn(tok, label);
+  }
+
+/* while expr do statement  ==>
+   (progn (label L) (if expr (progn statement (goto L))))             */
+TOKEN makewhile(TOKEN tok, TOKEN expr, TOKEN tokb, TOKEN statement)
+  { TOKEN label = makelabel();
+    int lnum = label->operands->intval;
+    TOKEN body = makeprogn(tokb, nconc(unprogn(statement), makegoto(lnum)));
+    TOKEN ifst = makeif(makeop(IFOP), expr, body, NULL);
+    label->link = ifst;
+    ifst->link = NULL;
+    return makeprogn(tok, label);
+  }
+
+/* ---------------- user labels ---------------- */
+#define MAXLABELS 100
+int labels[MAXLABELS];   /* labels[internal number] = user label number */
+
+void instlabel(TOKEN num)
+  { labels[labelnumber++] = num->intval; }
+
+int findlabel(int userlabel)
+  { int i;
+    for (i = 0; i < labelnumber; i++)
+      if (labels[i] == userlabel) return i;
+    fprintf(stderr, "Undeclared label: %d\n", userlabel);
+    return -1;
+  }
+
+TOKEN dogoto(TOKEN tok, TOKEN labeltok)
+  { return makegoto(findlabel(labeltok->intval)); }
+
+/* n: statement  ==>  (progn (label i) statement) */
+TOKEN dolabel(TOKEN labeltok, TOKEN tok, TOKEN statement)
+  { TOKEN label = makeop(LABELOP);
+    label->operands = makeintc(findlabel(labeltok->intval));
+    label->link = statement;
+    statement->link = NULL;
+    return makeprogn(tok, label);
+  }
+
+/* ---------------- type declarations ---------------- */
+
+/* settoktype: set symtype (and basicdt where meaningful) of tok */
+void settoktype(TOKEN tok, SYMBOL typ, SYMBOL ent)
+  { tok->symtype = typ;
+    if (ent != NULL) tok->symentry = ent;
+    if (typ != NULL && (typ->kind == BASICTYPE || typ->kind == SUBRANGE
+                        || typ->kind == POINTERSYM))
+      tok->basicdt = typ->basicdt;
+  }
+
+void insttype(TOKEN typename, TOKEN typetok)
+  { SYMBOL sym = searchins(typename->stringval);
+    SYMBOL typ = typetok->symtype;
+    sym->kind = TYPESYM;
+    sym->datatype = typ;
+    sym->size = typ->size;
+    sym->basicdt = typ->basicdt;
+  }
+
+TOKEN makesubrange(TOKEN tok, int low, int high)
+  { SYMBOL sym = symalloc();
+    sym->kind = SUBRANGE;
+    sym->basicdt = INTEGER;
+    sym->lowbound = low;
+    sym->highbound = high;
+    sym->size = basicsizes[INTEGER];
+    tok->symtype = sym;
+    return tok;
+  }
+
+/* (red, white, blue): install constants 0, 1, 2 and make 0..2 */
+TOKEN instenum(TOKEN idlist)
+  { int n = 0;
+    TOKEN tok;
+    for (tok = idlist; tok != NULL; tok = tok->link)
+      instconst(tok, makeintc(n++));
+    return makesubrange(idlist, 0, n - 1);
+  }
+
+TOKEN instdotdot(TOKEN lowtok, TOKEN dottok, TOKEN hightok)
+  { return makesubrange(dottok, lowtok->intval, hightok->intval); }
+
+/* ^ typename: the pointer points to the type name, which may not be
+   defined yet, so use searchins. */
+TOKEN instpoint(TOKEN tok, TOKEN typename)
+  { SYMBOL sym = symalloc();
+    sym->kind = POINTERSYM;
+    sym->basicdt = POINTER;
+    sym->datatype = searchins(typename->stringval);
+    sym->size = basicsizes[POINTER];
+    tok->symtype = sym;
+    return tok;
+  }
+
+/* put the type into each field name token */
+TOKEN instfields(TOKEN idlist, TOKEN typetok)
+  { TOKEN tok;
+    for (tok = idlist; tok != NULL; tok = tok->link)
+      tok->symtype = typetok->symtype;
+    return idlist;
+  }
+
+/* make a RECORDSYM with a linked list of field symbols */
+TOKEN instrec(TOKEN rectok, TOKEN argstok)
+  { SYMBOL rec = symalloc(), field, last = NULL;
+    int offset = 0;
+    TOKEN tok;
+    rec->kind = RECORDSYM;
+    for (tok = argstok; tok != NULL; tok = tok->link)
+      { field = makesym(tok->stringval);
+        field->datatype = tok->symtype;
+        field->basicdt = tok->symtype->basicdt;
+        field->size = tok->symtype->size;
+        field->offset = wordaddress(offset, alignsize(tok->symtype));
+        offset = field->offset + field->size;
+        if (last == NULL) rec->datatype = field;
+        else last->link = field;
+        last = field;
+      }
+    rec->size = wordaddress(offset, RECORDALIGN);
+    rectok->symtype = rec;
+    return rectok;
+  }
+
+/* array[b1, b2, ...] of type: an array of arrays, built from the end */
+TOKEN instarray(TOKEN bounds, TOKEN typetok)
+  { SYMBOL arr, range;
+    if (bounds->link != NULL) typetok = instarray(bounds->link, typetok);
+    range = bounds->symtype;
+    arr = symalloc();
+    arr->kind = ARRAYSYM;
+    arr->datatype = typetok->symtype;
+    arr->lowbound = range->lowbound;
+    arr->highbound = range->highbound;
+    arr->size = (range->highbound - range->lowbound + 1)
+                * typetok->symtype->size;
+    bounds->symtype = arr;
+    return bounds;
+  }
+
+/* ---------------- variable references ---------------- */
+
+int isintconst(TOKEN tok)
+  { return tok->tokentype == NUMBERTOK && tok->basicdt == INTEGER; }
+
+/* mulint: (* n exp), folding constants */
+TOKEN mulint(TOKEN exp, int n)
+  { if (isintconst(exp)) return fillintc(exp, exp->intval * n);
+    if (n == 1) return exp;
+    return binop(makeop(TIMESOP), makeintc(n), exp);
+  }
+
+/* addint: add integer expression off to exp, folding constants.
+   Constants are kept as the first operand of +.  */
+TOKEN addint(TOKEN exp, TOKEN off, TOKEN tok)
+  { TOKEN c;
+    if (isintconst(off) && isintconst(exp))
+      return fillintc(exp, exp->intval + off->intval);
+    if (isintconst(exp)) { c = exp; exp = off; off = c; }  /* off = const */
+    if (isintconst(off))
+      { if (off->intval == 0) return exp;
+        if (exp->tokentype == OPERATOR && exp->whichval == PLUSOP
+            && isintconst(exp->operands))
+          { exp->operands->intval += off->intval;
+            return exp;
+          }
+        return binop(tok ? tok : makeop(PLUSOP), off, exp);
+      }
+    return binop(tok ? tok : makeop(PLUSOP), exp, off);
+  }
+
+TOKEN makeplus(TOKEN lhs, TOKEN rhs, TOKEN tok)
+  { return addint(lhs, rhs, tok); }
+
+/* addoffs adds offset off to an aref expression exp */
+TOKEN addoffs(TOKEN exp, TOKEN off)
+  { TOKEN base = exp->operands;
+    TOKEN newoff = addint(base->link, off, NULL);
+    base->link = newoff;
+    newoff->link = NULL;
+    return exp;
+  }
+
+/* makearef: (aref var off); if var is already an aref, add the offset */
+TOKEN makearef(TOKEN var, TOKEN off, TOKEN tok)
+  { TOKEN aref;
+    if (var->tokentype == OPERATOR && var->whichval == AREFOP)
+      return addoffs(var, off);
+    aref = tok ? tok : talloc();
+    aref->tokentype = OPERATOR;
+    aref->whichval = AREFOP;
+    aref->operands = var;
+    var->link = off;
+    off->link = NULL;
+    aref->link = NULL;
+    return aref;
+  }
+
+/* var.field  ==>  (aref var offset) */
+TOKEN reducedot(TOKEN var, TOKEN dot, TOKEN field)
+  { SYMBOL rec = var->symtype, f;
+    TOKEN res;
+    assert(rec != NULL && rec->kind == RECORDSYM);
+    for (f = rec->datatype; f != NULL; f = f->link)
+      if (strcmp(f->namestring, field->stringval) == 0) break;
+    if (f == NULL)
+      { fprintf(stderr, "Unknown field: %s\n", field->stringval);
+        return var;
+      }
+    res = makearef(var, makeintc(f->offset), dot);
+    res->basicdt = 0;
+    settoktype(res, f->datatype, NULL);
+    return res;
+  }
+
+/* arr[s1, s2, ...]  ==>  (aref arr offset-expression) */
+TOKEN arrayref(TOKEN arr, TOKEN tok, TOKEN subs, TOKEN tokb)
+  { SYMBOL typ = arr->symtype;
+    int cterm = 0;
+    TOKEN vexp = NULL, sub, next, off, res;
+    for (sub = subs; sub != NULL; sub = next)
+      { next = sub->link;
+        sub->link = NULL;
+        assert(typ != NULL && typ->kind == ARRAYSYM);
+        int esize = typ->datatype->size;
+        cterm -= typ->lowbound * esize;
+        if (isintconst(sub)) cterm += sub->intval * esize;
+        else
+          { TOKEN term = mulint(sub, esize);
+            vexp = (vexp == NULL) ? term : addint(vexp, term, NULL);
+          }
+        typ = typ->datatype;
+      }
+    off = (vexp == NULL) ? makeintc(cterm)
+                         : addint(vexp, makeintc(cterm), NULL);
+    res = makearef(arr, off, tok);
+    res->basicdt = 0;
+    settoktype(res, typ, NULL);
+    return res;
+  }
+
+/* var^  ==>  (^ var), whose type is the record pointed to */
+TOKEN dopoint(TOKEN var, TOKEN tok)
+  { SYMBOL ptype = var->symtype;
+    assert(ptype != NULL && ptype->kind == POINTERSYM);
+    tok->operands = var;
+    var->link = NULL;
+    tok->basicdt = 0;
+    settoktype(tok, ptype->datatype->datatype, NULL);
+    return tok;
   }
 
 /* instconst installs a constant in the symbol table */
@@ -551,8 +850,8 @@ int main(void)
     init_charclass();
     initsyms();
     res = yyparse();
-    printstlevel(1);    /* to see level 0 too, change to:   printst();  */
     printf("yyparse result = %8d\n", res);
+    printstlevel(1);    /* to see level 0 too, change to:   printst();  */
     if (DEBUG & DB_PARSERES) dbugprinttok(parseresult);
     ppexpr(parseresult);           /* Pretty-print the result tree */
     return 0;
