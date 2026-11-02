@@ -365,7 +365,7 @@ int yylex()
         case DELIMITER:     return tok->whichval + DELIMITER_BIAS;
         case RESERVED:      return tok->whichval + RESERVED_BIAS;
         case IDENTIFIERTOK: return IDENTIFIER;
-        case STRINGTOK:     return STRING;
+        case STRINGTOK:     tok->basicdt = STRINGTYPE; return STRING;
         case NUMBERTOK:     return NUMBER;
       }
     return 0;

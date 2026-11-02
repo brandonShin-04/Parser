@@ -65,11 +65,25 @@ TOKEN parseresult;
 
 %%
 
-program    :  PROGRAM IDENTIFIER LPAREN idlist RPAREN SEMICOLON vblock DOT
+program    :  PROGRAM IDENTIFIER LPAREN idlist RPAREN SEMICOLON cblock DOT
                                        { parseresult = makeprogram($2, $4, $7); }
            ;
 idlist     :  IDENTIFIER COMMA idlist          { $$ = cons($1, $3); }
            |  IDENTIFIER                       { $$ = cons($1, NULL); }
+           ;
+cblock     :  CONST cdefs vblock               { $$ = $3; }
+           |  vblock
+           ;
+cdefs      :  cdef SEMICOLON cdefs
+           |  cdef SEMICOLON
+           ;
+cdef       :  IDENTIFIER EQ constant           { instconst($1, $3); }
+           ;
+constant   :  NUMBER
+           |  sign NUMBER                      { $$ = unaryop($1, $2); }
+           |  STRING
+           |  IDENTIFIER                       { $$ = findid($1); }
+           |  sign IDENTIFIER                  { $$ = unaryop($1, findid($2)); }
            ;
 vblock     :  VAR varspecs block               { $$ = $3; }
            |  block
@@ -84,16 +98,21 @@ type       :  simpletype
 simpletype :  IDENTIFIER                       { $$ = findtype($1); }
            ;
 block      :  BEGINBEGIN statement endpart
-                                       { $$ = makeprogn($1, cons($2, $3)); }
+                                       { $$ = makepnb($1, cons($2, $3)); }
            ;
 statement  :  block
            |  IF expr THEN statement endif     { $$ = makeif($1, $2, $4, $5); }
            |  assignment
            |  funcall
+           |  REPEAT stmtlist UNTIL expr
+                                    { $$ = makerepeat($1, $2, $3, $4); }
            |  FOR assignment TO expr DO statement
                                     { $$ = makefor(1, $1, $2, $3, $4, $5, $6); }
            |  FOR assignment DOWNTO expr DO statement
                                     { $$ = makefor(-1, $1, $2, $3, $4, $5, $6); }
+           ;
+stmtlist   :  statement SEMICOLON stmtlist     { $$ = cons($1, $3); }
+           |  statement                        { $$ = cons($1, NULL); }
            ;
 endpart    :  SEMICOLON statement endpart      { $$ = cons($2, $3); }
            |  END                              { $$ = NULL; }
@@ -166,7 +185,32 @@ TOKEN cons(TOKEN item, TOKEN list)           /* add item to front of list */
   }
 
 TOKEN binop(TOKEN op, TOKEN lhs, TOKEN rhs)        /* reduce binary operator */
-  { op->operands = lhs;          /* link operands to operator       */
+  { int ldt = lhs->basicdt, rdt = rhs->basicdt;
+    if (op->tokentype == OPERATOR)
+      { switch (op->whichval)
+          { case ASSIGNOP:                    /* convert rhs to type of lhs */
+              if (ldt == INTEGER && rdt == REAL) rhs = makefix(rhs);
+              else if (ldt == REAL && rdt == INTEGER) rhs = makefloat(rhs);
+              op->basicdt = ldt;
+              break;
+            case PLUSOP: case MINUSOP: case TIMESOP: case DIVIDEOP:
+            case EQOP: case NEOP: case LTOP: case LEOP: case GEOP: case GTOP:
+              if (ldt == REAL && rdt == INTEGER) rhs = makefloat(rhs);
+              else if (ldt == INTEGER && rdt == REAL) lhs = makefloat(lhs);
+              else if (op->whichval == DIVIDEOP && ldt == INTEGER
+                       && rdt == INTEGER)
+                { lhs = makefloat(lhs); rhs = makefloat(rhs); }
+              if (op->whichval >= EQOP) op->basicdt = BOOLETYPE;
+              else op->basicdt = (ldt == REAL || rdt == REAL
+                                  || op->whichval == DIVIDEOP)
+                                   ? REAL : ldt;
+              break;
+            default:
+              op->basicdt = ldt;
+              break;
+          }
+      }
+    op->operands = lhs;          /* link operands to operator       */
     lhs->link = rhs;             /* link second operand to first    */
     rhs->link = NULL;            /* terminate operand list          */
     if (DEBUG & DB_BINOP)
@@ -181,6 +225,12 @@ TOKEN binop(TOKEN op, TOKEN lhs, TOKEN rhs)        /* reduce binary operator */
 /* unary operator: a leading + is dropped; - becomes (- x) */
 TOKEN unaryop(TOKEN op, TOKEN lhs)
   { if (op->whichval == PLUSOP) return lhs;
+    if (op->whichval == MINUSOP && lhs->tokentype == NUMBERTOK)
+      { if (lhs->basicdt == REAL) lhs->realval = -lhs->realval;
+        else lhs->intval = -lhs->intval;
+        return lhs;                          /* fold negative constant */
+      }
+    op->basicdt = lhs->basicdt;
     op->operands = lhs;
     lhs->link = NULL;
     return op;
@@ -210,6 +260,38 @@ TOKEN fillintc(TOKEN tok, int num)
 TOKEN makeintc(int num)
   { return fillintc(talloc(), num); }
 
+/* makefloat: float a constant, or wrap tok in (float tok) */
+TOKEN makefloat(TOKEN tok)
+  { TOKEN op;
+    if (tok->tokentype == NUMBERTOK)
+      { tok->realval = (double) tok->intval;
+        tok->basicdt = REAL;
+        return tok;
+      }
+    op = makeop(FLOATOP);
+    op->basicdt = REAL;
+    op->operands = tok;
+    op->link = NULL;
+    tok->link = NULL;
+    return op;
+  }
+
+/* makefix: truncate a constant, or wrap tok in (fix tok) */
+TOKEN makefix(TOKEN tok)
+  { TOKEN op;
+    if (tok->tokentype == NUMBERTOK)
+      { tok->intval = (int) tok->realval;
+        tok->basicdt = INTEGER;
+        return tok;
+      }
+    op = makeop(FIXOP);
+    op->basicdt = INTEGER;
+    op->operands = tok;
+    op->link = NULL;
+    tok->link = NULL;
+    return op;
+  }
+
 TOKEN makeif(TOKEN tok, TOKEN exp, TOKEN thenpart, TOKEN elsepart)
   {  tok->tokentype = OPERATOR;  /* Make it look like an operator   */
      tok->whichval = IFOP;
@@ -238,6 +320,16 @@ TOKEN makeprogn(TOKEN tok, TOKEN statements)
        };
      return tok;
    }
+
+/* makepnb: like makeprogn, but if statements is a single progn,
+   just return it. */
+TOKEN makepnb(TOKEN tok, TOKEN statements)
+  { if (statements != NULL && statements->link == NULL
+        && statements->tokentype == OPERATOR
+        && statements->whichval == PROGNOP)
+      return statements;
+    return makeprogn(tok, statements);
+  }
 
 /* If stmt is a progn, return its list of statements; else stmt itself.
    Used to avoid needless nested progn's in loop bodies. */
@@ -277,6 +369,14 @@ TOKEN makefuncall(TOKEN tok, TOKEN fn, TOKEN args)
     tok->whichval = FUNCALLOP;
     tok->operands = fn;
     fn->link = args;
+    /* choose write/writeln variant by argument type */
+    if (args != NULL && (strcmp(fn->stringval, "write") == 0
+                         || strcmp(fn->stringval, "writeln") == 0))
+      { if (args->basicdt == INTEGER && args->tokentype != STRINGTOK)
+          strcat(fn->stringval, "i");
+        else if (args->basicdt == REAL)
+          strcat(fn->stringval, "f");
+      }
     sym = searchst(fn->stringval);
     if (sym != NULL && sym->kind == FUNCTIONSYM && sym->datatype != NULL
         && sym->datatype->datatype != NULL)
@@ -335,12 +435,58 @@ TOKEN makefor(int sign, TOKEN tok, TOKEN asg, TOKEN tokb, TOKEN endexpr,
     return makeprogn(tok, asg);
   }
 
+/* repeat statements until expr  ==>
+   (progn (label L) statements... (if expr (progn) (goto L)))         */
+TOKEN makerepeat(TOKEN tok, TOKEN statements, TOKEN tokb, TOKEN expr)
+  { TOKEN label = makelabel();
+    int lnum = label->operands->intval;
+    TOKEN body = NULL, s, next, empty, ifst;
+    for (s = statements; s != NULL; s = next)   /* splice nested progns */
+      { next = s->link;
+        body = nconc(body, unprogn(s));
+      }
+    empty = makeprogn(talloc(), NULL);
+    empty->link = makegoto(lnum);
+    ifst = makeop(IFOP);
+    ifst->operands = expr;
+    expr->link = empty;
+    label->link = nconc(body, ifst);
+    return makeprogn(tok, label);
+  }
+
+/* instconst installs a constant in the symbol table */
+void instconst(TOKEN idtok, TOKEN consttok)
+  { SYMBOL sym = insertsym(idtok->stringval);
+    sym->kind = CONSTSYM;
+    sym->basicdt = consttok->basicdt;
+    if (consttok->tokentype == STRINGTOK)
+      { sym->basicdt = STRINGTYPE;
+        strncpy(sym->constval.stringconst, consttok->stringval, 16);
+      }
+    else if (sym->basicdt == REAL) sym->constval.realnum = consttok->realval;
+    else sym->constval.intnum = consttok->intval;
+    sym->size = basicsizes[sym->basicdt];
+  }
+
 /* findid looks up an identifier, setting its symentry and symtype. */
 TOKEN findid(TOKEN tok)
   { SYMBOL sym, typ;
     sym = searchst(tok->stringval);
     if (sym == NULL)
       { fprintf(stderr, "Undeclared identifier: %s\n", tok->stringval);
+        return tok;
+      }
+    if (sym->kind == CONSTSYM)          /* replace constant by its value */
+      { if (sym->basicdt == STRINGTYPE)
+          { tok->tokentype = STRINGTOK;
+            strncpy(tok->stringval, sym->constval.stringconst, 16);
+          }
+        else
+          { tok->tokentype = NUMBERTOK;
+            if (sym->basicdt == REAL) tok->realval = sym->constval.realnum;
+            else tok->intval = sym->constval.intnum;
+          }
+        tok->basicdt = sym->basicdt;
         return tok;
       }
     tok->symentry = sym;
